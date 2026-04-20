@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,7 +29,25 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        # Select model class based on HuggingFace config.model_type.
+        # Dense Qwen3 uses "qwen3", MoE uses "qwen3_moe".
+        # This is the only place model selection happens — the rest of the
+        # engine (scheduler, KV cache, CUDA graphs) is model-agnostic.
+        is_moe = getattr(hf_config, "model_type", "qwen3") == "qwen3_moe"
+        if is_moe:
+            self.model = Qwen3MoeForCausalLM(hf_config)
+            # MoE models MUST run in eager mode — CUDA graphs are incompatible.
+            # Two reasons:
+            # 1. moe_align_block_size performs data-dependent token sorting that
+            #    changes every step (different tokens route to different experts).
+            #    CUDA graphs capture a fixed sequence of operations, so they can't
+            #    handle dynamic routing decisions.
+            # 2. The sorting function uses Python loops with .item() calls that
+            #    force CPU-GPU synchronization — illegal during graph capture,
+            #    causing "CUDA illegal memory access" errors.
+            self.enforce_eager = True
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
