@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
@@ -6,12 +7,17 @@ from nanovllm import LLM, SamplingParams
 
 
 def main():
+    if len(sys.argv) < 2:
+        print("Usage: python script.py <model_path>")
+        sys.exit(1)
+
+    path = os.path.expanduser(sys.argv[1])
+
     seed(0)
     num_seqs = 256
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]

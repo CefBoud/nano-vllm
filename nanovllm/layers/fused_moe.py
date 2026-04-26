@@ -37,6 +37,36 @@ and return early — no wasted compute.
 
 After the kernel, an all-reduce across GPUs sums the partial outputs
 (each GPU contributed results for its local experts only).
+
+=== CUDA Graph Compatibility ===
+
+CUDA graphs record a sequence of GPU kernel launches once, then "replay"
+them on future steps — eliminating CPU-side kernel launch overhead. This
+is critical for decode (1 token per sequence) where the GPU work per step
+is tiny and launch overhead dominates.
+
+The challenge with MoE is that the token sorting step traditionally uses
+operations that break CUDA graphs:
+
+  1. `.item()` calls that force CPU-GPU synchronization
+  2. Dynamic-size tensor allocations (size depends on routing results)
+  3. `torch.repeat_interleave` with data-dependent output sizes
+
+Our solution uses three techniques to make MoE graph-compatible:
+
+  1. **Pre-allocated fixed-size buffers**: All sorting outputs are allocated
+     once to worst-case maximum size. The Triton kernel early-exits for
+     unused blocks via a GPU-resident count (no CPU involvement).
+
+  2. **Triton sorting kernels**: A histogram kernel (counts pairs per expert
+     via atomic adds) and a scatter kernel (writes pair indices into sorted
+     positions via atomic slot reservation) replace the old argsort-based
+     sorting. Both are O(n) and fully GPU-resident.
+
+  3. **GPU-resident metadata**: `num_tokens_post_padded` stays as a GPU
+     tensor (never pulled to CPU with `.item()`). The GEMM kernel reads it
+     directly for early-exit decisions. `torch.searchsorted` replaces
+     `repeat_interleave` for expert_ids, giving fixed output size.
 """
 
 import torch
@@ -48,45 +78,356 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# Token Sorting (moe_align_block_size)
+# Constants
 # ---------------------------------------------------------------------------
-# Before we can run the fused kernel, we need to reorganize tokens so that
-# all tokens assigned to the same expert are contiguous in memory. This is
-# the "preparation" step that feeds the Triton kernel.
+
+# Block size for the Triton fused MoE GEMM kernel's M dimension (tokens).
+# This MUST match the BLOCK_SIZE_M used in invoke_fused_moe_kernel.
+# The sorting step pads each expert's token count to a multiple of this.
+MOE_BLOCK_SIZE_M = 64
+
+
+# ===========================================================================
+# Triton Sorting Kernels (CUDA-Graph-Safe)
+# ===========================================================================
+#
+# These two small Triton kernels replace the Python-level token sorting
+# that was incompatible with CUDA graphs. Together they sort token-expert
+# pairs by expert in O(n) time using GPU atomics.
+#
+# Old approach (graph-BREAKING):
+#   1. bincount → histogram       (OK but we replace for consistency)
+#   2. .item() → CPU-GPU sync     ← BREAKS GRAPH
+#   3. torch.full(dynamic_size)   ← BREAKS GRAPH (variable allocation)
+#   4. repeat_interleave          ← BREAKS GRAPH (variable output size)
+#   5. argsort + scatter          (O(n log n), replaced with O(n) atomics)
+#
+# New approach (graph-SAFE):
+#   1. Triton histogram kernel    → count pairs per expert (GPU atomics)
+#   2. cumsum on GPU              → expert offsets (standard CUDA op)
+#   3. GPU tensor assignment      → total count stays on GPU (no .item())
+#   4. searchsorted               → expert_ids with fixed output size
+#   5. Triton scatter kernel      → fill sorted_token_ids (GPU atomics)
+#   6. All buffers pre-allocated  → no dynamic allocation
+#
+# ===========================================================================
+
+
+@triton.jit
+def _moe_histogram_kernel(
+    # --- Pointers ---
+    topk_ids_ptr,              # [num_pairs] flattened expert assignments (int32)
+    tokens_per_expert_ptr,     # [E] output histogram, MUST be pre-zeroed (int32)
+    # --- Scalars ---
+    num_pairs,                 # Total number of token-expert pairs (T * K)
+    # --- Compile-time constants ---
+    BLOCK_SIZE: tl.constexpr,  # Pairs processed per Triton program (e.g., 256)
+):
+    """
+    Count how many token-expert pairs are assigned to each expert.
+
+    Replaces `torch.bincount(flat_ids, minlength=num_experts)` with a
+    Triton kernel that uses `tl.atomic_add` for CUDA-graph-safe counting.
+
+    === How it works ===
+
+    The grid has ceil(num_pairs / BLOCK_SIZE) programs. Each program
+    processes BLOCK_SIZE consecutive pairs from the flattened topk_ids:
+
+        Program 0: pairs [0, BLOCK_SIZE)
+        Program 1: pairs [BLOCK_SIZE, 2*BLOCK_SIZE)
+        ...
+
+    For each pair, the kernel loads the expert ID and atomically increments
+    that expert's counter in the output histogram.
+
+    === Example ===
+
+    num_experts=4, num_pairs=8, BLOCK_SIZE=4
+    topk_ids (flat) = [2, 3, 0, 2, 1, 0, 3, 1]
+
+    Program 0 processes pairs 0-3: expert IDs [2, 3, 0, 2]
+      atomic_add(tokens_per_expert[2], 1) → [0, 0, 1, 0]
+      atomic_add(tokens_per_expert[3], 1) → [0, 0, 1, 1]
+      atomic_add(tokens_per_expert[0], 1) → [1, 0, 1, 1]
+      atomic_add(tokens_per_expert[2], 1) → [1, 0, 2, 1]
+
+    Program 1 processes pairs 4-7: expert IDs [1, 0, 3, 1]
+      (runs CONCURRENTLY with Program 0 on different SMs!)
+      atomic_add(tokens_per_expert[1], 1) → [1, 1, 2, 1]
+      atomic_add(tokens_per_expert[0], 1) → [2, 1, 2, 1]
+      atomic_add(tokens_per_expert[3], 1) → [2, 1, 2, 2]
+      atomic_add(tokens_per_expert[1], 1) → [2, 2, 2, 2]
+
+    Final result: [2, 2, 2, 2] — each expert got 2 pairs. ✓
+
+    === Why atomic_add? ===
+
+    Multiple programs run in parallel on different SMs (streaming multi-
+    processors). If two programs try to increment the same expert's counter
+    simultaneously without atomics, one increment would be lost (classic
+    read-modify-write race condition). `tl.atomic_add` uses hardware-level
+    atomic instructions that serialize conflicting writes to the SAME
+    address while allowing non-conflicting writes to DIFFERENT addresses
+    to proceed in full parallel.
+    """
+    # Which chunk of pairs does this program handle?
+    pid = tl.program_id(axis=0)
+
+    # Compute the pair indices for this program.
+    # offs = [pid*BS, pid*BS+1, ..., pid*BS+BS-1]
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    # Mask: the last program may extend beyond num_pairs.
+    mask = offs < num_pairs
+
+    # Load expert IDs for this chunk.
+    expert_ids = tl.load(topk_ids_ptr + offs, mask=mask)
+
+    # Atomically increment each expert's counter.
+    # Multiple programs may count pairs for the same expert concurrently —
+    # the hardware serializes only the conflicting accesses (same address),
+    # while non-conflicting ones (different experts) proceed in parallel.
+    tl.atomic_add(tokens_per_expert_ptr + expert_ids, 1, mask=mask)
+
+
+@triton.jit
+def _moe_scatter_kernel(
+    # --- Pointers ---
+    topk_ids_ptr,              # [num_pairs] flattened expert assignments (int32)
+    sorted_token_ids_ptr,      # [max_padded] output buffer (pre-filled with sentinel)
+    write_counters_ptr,        # [E] atomic write pointers (init to expert_offsets[:E])
+    # --- Scalars ---
+    num_pairs,                 # Total number of token-expert pairs (T * K)
+    # --- Compile-time constants ---
+    BLOCK_SIZE: tl.constexpr,  # Pairs processed per Triton program (e.g., 256)
+):
+    """
+    Scatter pair indices into expert-sorted positions using atomic slot
+    reservation. Replaces the old argsort + scatter approach with a
+    single-pass O(n) atomic scatter.
+
+    === How it works ===
+
+    Before calling this kernel, the caller initializes:
+        write_counters[e] = expert_offsets[e]
+
+    This is the starting write position for expert e in sorted_token_ids.
+
+    For each pair, the kernel:
+      1. Loads the pair's expert ID
+      2. Atomically reserves a slot:
+           slot = atomic_add(write_counters[expert], 1)
+         atomic_add returns the OLD value = the position to write to,
+         then increments the counter (so the next pair for this expert
+         gets the next position — like taking a number at a deli counter).
+      3. Writes the pair index into sorted_token_ids[slot]
+
+    === Example ===
+
+    4 experts, block_size=4, num_pairs=8
+    topk_ids (flat) = [2, 3, 0, 2, 1, 0, 3, 1]
+
+    expert_offsets   = [0, 4, 8, 12, 16]
+    write_counters   = [0, 4, 8, 12]  (copied from expert_offsets[:4])
+    sorted_token_ids = [8,8,8,8, 8,8,8,8, 8,8,8,8, 8,8,8,8]  (sentinel=8)
+
+    Program 0 processes pairs 0-3 (expert IDs [2, 3, 0, 2]):
+      Pair 0 (expert 2): slot=atomic_add(counters[2],1)=8  → ids[8]=0
+      Pair 1 (expert 3): slot=atomic_add(counters[3],1)=12 → ids[12]=1
+      Pair 2 (expert 0): slot=atomic_add(counters[0],1)=0  → ids[0]=2
+      Pair 3 (expert 2): slot=atomic_add(counters[2],1)=9  → ids[9]=3
+
+    Program 1 processes pairs 4-7 (expert IDs [1, 0, 3, 1]):
+      Pair 4 (expert 1): slot=atomic_add(counters[1],1)=4  → ids[4]=4
+      Pair 5 (expert 0): slot=atomic_add(counters[0],1)=1  → ids[1]=5
+      Pair 6 (expert 3): slot=atomic_add(counters[3],1)=13 → ids[13]=6
+      Pair 7 (expert 1): slot=atomic_add(counters[1],1)=5  → ids[5]=7
+
+    Final sorted_token_ids (grouped by expert):
+      Expert 0: [2, 5, 8, 8]   ← pairs for expert 0, padded with sentinel
+      Expert 1: [4, 7, 8, 8]   ← pairs for expert 1, padded with sentinel
+      Expert 2: [0, 3, 8, 8]   ← pairs for expert 2, padded with sentinel
+      Expert 3: [1, 6, 8, 8]   ← pairs for expert 3, padded with sentinel
+    Exactly the sorted order the GEMM kernel needs. ✓
+
+    === Why this is CUDA-graph-safe ===
+
+    - No .item() calls — everything stays on GPU
+    - All buffers are pre-allocated to fixed max size
+    - The scatter writes DIFFERENT data each step (routing changes), but
+      buffer SIZES and kernel GRID are always the same
+    - CUDA graphs replay the same kernel launches with the same tensor
+      addresses — they don't care about data values, only structure
+    """
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < num_pairs
+
+    # Load expert IDs for this chunk.
+    expert_ids = tl.load(topk_ids_ptr + offs, mask=mask)
+
+    # Atomically reserve a write slot for each pair.
+    # Returns the OLD counter value = the position to write to.
+    # After the add, the counter is incremented for the next pair.
+    slots = tl.atomic_add(write_counters_ptr + expert_ids, 1, mask=mask)
+
+    # Write pair index into the reserved slot.
+    tl.store(sorted_token_ids_ptr + slots, offs.to(tl.int32), mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Buffer Allocation Helper
+# ---------------------------------------------------------------------------
+
+def _allocate_sorting_buffers(
+    max_num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    block_size: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """
+    Allocate fixed-size buffers for CUDA-graph-safe MoE token sorting.
+
+    All buffers are sized for the WORST CASE to guarantee that no
+    reallocation is ever needed during CUDA graph replay:
+
+        max_pairs  = max_num_tokens * top_k
+        max_padded = max_pairs + num_experts * (block_size - 1)
+        max_blocks = max_padded // block_size
+
+    The worst-case padding occurs when every expert receives at least one
+    pair, requiring each to be padded up to a full block_size. Each expert
+    can waste at most (block_size - 1) padding slots.
+
+    Example: T=512, K=8, E=128, block_size=64
+        max_pairs  = 512 * 8 = 4096 total token-expert pairs
+        max_padded = 4096 + 128 * 63 = 12160 total slots after padding
+        max_blocks = 12160 / 64 = 190 blocks for the GEMM kernel
+
+    In practice, actual usage is much smaller (tokens cluster among popular
+    experts). Unused slots are filled with sentinel values and the GEMM
+    kernel early-exits for blocks beyond the real data.
+
+    Args:
+        max_num_tokens: Maximum tokens in any single forward pass.
+        top_k: Number of experts per token (e.g., 8 for Qwen3-30B-A3B).
+        num_experts: Total number of (global) experts.
+        block_size: BLOCK_SIZE_M for the Triton GEMM kernel (e.g., 64).
+        device: CUDA device for tensor allocation.
+
+    Returns:
+        dict of pre-allocated tensors for moe_align_block_size.
+    """
+    max_pairs = max_num_tokens * top_k
+    max_padded = max_pairs + num_experts * (block_size - 1)
+    max_blocks = max_padded // block_size
+
+    return {
+        # sorted_token_ids: [max_padded] int32
+        # After sorting, pair indices grouped by expert, padded with sentinels.
+        # The GEMM kernel masks out entries >= num_valid_tokens.
+        'sorted_token_ids': torch.empty(
+            max_padded, dtype=torch.int32, device=device,
+        ),
+
+        # expert_ids: [max_blocks] int32
+        # Maps each block of BLOCK_SIZE_M tokens to its expert.
+        # Blocks beyond num_tokens_post_padded have stale/clamped IDs but
+        # are early-exited by the kernel before the ID is ever used.
+        'expert_ids': torch.empty(
+            max_blocks, dtype=torch.int32, device=device,
+        ),
+
+        # num_tokens_post_padded: [1] int32
+        # Total valid slots after padding (stays on GPU — no .item()!).
+        # The GEMM kernel reads this via tl.load() for early-exit.
+        'num_tokens_post_padded': torch.empty(
+            1, dtype=torch.int32, device=device,
+        ),
+
+        # tokens_per_expert: [E] int32
+        # Scratch: histogram of pairs per expert. Zeroed each call.
+        'tokens_per_expert': torch.empty(
+            num_experts, dtype=torch.int32, device=device,
+        ),
+
+        # expert_offsets: [E+1] int32
+        # Cumulative padded counts. expert_offsets[e] = start position for
+        # expert e. expert_offsets[E] = total = num_tokens_post_padded.
+        'expert_offsets': torch.empty(
+            num_experts + 1, dtype=torch.int32, device=device,
+        ),
+
+        # write_counters: [E] int32
+        # Scratch for the scatter kernel. Initialized to expert_offsets[:E]
+        # before each scatter, then atomically incremented.
+        'write_counters': torch.empty(
+            num_experts, dtype=torch.int32, device=device,
+        ),
+
+        # block_positions: [max_blocks] int32
+        # Pre-computed arithmetic sequence: [0, block_size, 2*block_size, ...].
+        # Used by searchsorted to map block indices → expert IDs.
+        # Computed once and never changes.
+        'block_positions': (
+            torch.arange(max_blocks, dtype=torch.int32, device=device)
+            * block_size
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Token Sorting (moe_align_block_size) — CUDA-Graph-Safe Version
+# ---------------------------------------------------------------------------
+# Before we can run the fused GEMM kernel, we need to reorganize tokens so
+# that all tokens assigned to the same expert are contiguous in memory.
 #
 # Why padding? The Triton kernel processes tokens in blocks of BLOCK_SIZE_M.
 # If expert 5 has 7 tokens and BLOCK_SIZE_M=64, we pad to 64 so the kernel
 # can process a full tile. Padded slots use token_id = num_valid_tokens,
 # which the kernel masks out.
+#
+# This version writes into PRE-ALLOCATED buffers (no return value) and uses
+# Triton kernels + searchsorted instead of .item() / repeat_interleave.
 # ---------------------------------------------------------------------------
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    *,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    write_counters: torch.Tensor,
+    block_positions: torch.Tensor,
     expert_map: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> None:
     """
-    Sort token-expert pairs by expert and pad to block_size alignment.
+    Sort token-expert pairs by expert, writing into pre-allocated buffers.
+
+    This function is CUDA-graph-safe: no .item() calls, no dynamic-size
+    allocations, no data-dependent output sizes. All buffers are pre-allocated
+    to worst-case max by _allocate_sorting_buffers().
 
     Args:
         topk_ids: [num_tokens, top_k] — which experts each token selected.
         block_size: BLOCK_SIZE_M for the Triton kernel (e.g. 64).
         num_experts: Total (global) number of experts.
-        expert_map: [num_experts] mapping global expert ID -> local ID (or -1).
-                    Used for Expert Parallelism to mark non-local experts.
+        sorted_token_ids: [max_padded] pre-allocated output buffer.
+        expert_ids: [max_blocks] pre-allocated output buffer.
+        num_tokens_post_padded: [1] pre-allocated scalar buffer.
+        tokens_per_expert: [E] scratch buffer for histogram.
+        expert_offsets: [E+1] scratch buffer for cumulative offsets.
+        write_counters: [E] scratch buffer for scatter kernel.
+        block_positions: [max_blocks] pre-computed [0, BS, 2*BS, ...].
+        expert_map: [E] global→local expert ID mapping (EP), or None.
 
-    Returns:
-        sorted_token_ids: Flat tensor of token-expert pair indices, sorted by
-                          expert, padded so each expert's count is a multiple
-                          of block_size. "Token-expert pair index" means the
-                          index into the flattened topk_ids — so if token 3
-                          selected experts [7, 12], index 6 = 3*2+0 maps to
-                          expert 7, and index 7 = 3*2+1 maps to expert 12.
-        expert_ids: [num_blocks] — which expert each block of BLOCK_SIZE_M
-                    tokens belongs to. -1 for non-local experts (EP).
-        num_tokens_post_padded: Scalar tensor — total length of sorted_token_ids
-                                after padding.
+    Returns nothing — results are written into the pre-allocated buffers.
 
     Example with 4 tokens, top_k=2, 4 experts, block_size=4:
         topk_ids = [[2,3], [0,2], [1,0], [3,1]]
@@ -94,121 +435,165 @@ def moe_align_block_size(
         Flattened: [2, 3, 0, 2, 1, 0, 3, 1]
         Pair indices:  0  1  2  3  4  5  6  7
 
-        Group by expert:
-          Expert 0: pair indices [2, 5]   (from tokens 1 and 2)
-          Expert 1: pair indices [4, 7]   (from tokens 2 and 3)
-          Expert 2: pair indices [0, 3]   (from tokens 0 and 1)
-          Expert 3: pair indices [1, 6]   (from tokens 0 and 3)
+        After sorting + padding to block_size=4:
+          Expert 0: [2, 5, 8, 8]    (8 = sentinel = num_pairs)
+          Expert 1: [4, 7, 8, 8]
+          Expert 2: [0, 3, 8, 8]
+          Expert 3: [1, 6, 8, 8]
 
-        After padding to block_size=4:
-          Expert 0: [2, 5, PAD, PAD]    Expert 1: [4, 7, PAD, PAD]
-          Expert 2: [0, 3, PAD, PAD]    Expert 3: [1, 6, PAD, PAD]
-
-        sorted_token_ids = [2,5,8,8, 4,7,8,8, 0,3,8,8, 1,6,8,8]
-                                                      (8 = num_valid_tokens = padding sentinel)
-        expert_ids = [0, 1, 2, 3]  (one per block of 4)
+        sorted_token_ids = [2,5,8,8, 4,7,8,8, 0,3,8,8, 1,6,8,8, ...]
+                                                         ^^^ rest is sentinel
+        expert_ids = [0, 1, 2, 3, ...]
+                                   ^^^ rest is clamped/stale (early-exited)
+        num_tokens_post_padded = [16]  (on GPU, never pulled to CPU)
     """
     num_tokens = topk_ids.size(0)
     top_k = topk_ids.size(1)
-    num_valid_tokens = num_tokens * top_k  # total token-expert pairs
+    num_pairs = num_tokens * top_k  # total token-expert pairs
 
-    # flatten: [T, K] -> [T*K], giving us a flat list of expert assignments
-    flat_ids = topk_ids.flatten()
+    # Convert to int32 for Triton atomics. Expert IDs are small integers
+    # (< num_experts, typically 128), so int32 is more than sufficient.
+    # topk_ids is int64 (from torch.topk), but int32 is needed because
+    # the Triton atomic operations target int32 buffers.
+    flat_ids = topk_ids.flatten().int()
 
-    # Count how many token-expert pairs each expert received.
-    # bincount gives us a histogram: tokens_per_expert[e] = number of pairs
-    # assigned to expert e.
-    tokens_per_expert = torch.bincount(flat_ids, minlength=num_experts)
+    # === Step 1: Count pairs per expert (Triton histogram kernel) ===
+    #
+    # Zero the histogram, then count via parallel atomic increments.
+    # This replaces torch.bincount which is likely graph-safe but we use
+    # the Triton kernel for consistency and educational value.
+    #
+    # Grid: ceil(num_pairs / 256) programs, each processing 256 pairs.
+    # With 4096 pairs (512 tokens × 8 top_k), that's 16 programs.
+    tokens_per_expert.zero_()
+    HISTOGRAM_BLOCK_SIZE = 256
+    histogram_grid = (triton.cdiv(num_pairs, HISTOGRAM_BLOCK_SIZE),)
+    _moe_histogram_kernel[histogram_grid](
+        flat_ids, tokens_per_expert, num_pairs,
+        BLOCK_SIZE=HISTOGRAM_BLOCK_SIZE,
+    )
 
-    # Pad each expert's count up to the next multiple of block_size.
-    # This ensures the Triton kernel can process full tiles for every expert.
+    # === Step 2: Pad each expert's count to block_size alignment ===
+    #
+    # Element-wise ops on fixed-size GPU tensors → graph-safe.
+    # Example: counts [7, 0, 3, 5] with block_size=4 → [8, 0, 4, 8]
     tokens_per_expert_padded = (
         (tokens_per_expert + block_size - 1) // block_size * block_size
     )
-    num_tokens_post_padded = tokens_per_expert_padded.sum().item()
 
-    # Compute the starting offset for each expert in the sorted output.
-    # expert_offsets[e] = sum of padded counts for experts 0..e-1.
-    expert_offsets = torch.zeros(
-        num_experts + 1, dtype=torch.int32, device=topk_ids.device
-    )
-    expert_offsets[1:] = tokens_per_expert_padded.cumsum(0)
-
-    # Allocate output arrays.
-    # sorted_token_ids: filled with num_valid_tokens (the padding sentinel).
-    # Any slot that isn't overwritten stays as the sentinel, which the kernel
-    # masks out (token_id >= num_valid_tokens → skip).
-    sorted_token_ids = torch.full(
-        (num_tokens_post_padded,),
-        fill_value=num_valid_tokens,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
-
-    # expert_ids: one entry per block, tells the kernel which expert's weights
-    # to use for that block of BLOCK_SIZE_M tokens.
-    # We use repeat_interleave to expand each expert_idx by its number of blocks.
-    # E.g., if expert 0 gets 2 blocks and expert 1 gets 1 block:
-    #   expert_ids = [0, 0, 1]
-    # This avoids a Python loop with .item() calls.
-    blocks_per_expert = tokens_per_expert_padded // block_size
-    expert_ids = torch.repeat_interleave(
-        torch.arange(num_experts, dtype=torch.int32, device=topk_ids.device),
-        blocks_per_expert.int(), # this second arg indicates how much each elem from the first arg is repeated
-    )
-
-    # Fill sorted_token_ids by scattering each pair index into the right
-    # position within each expert's allocated slot range.
+    # === Step 3: Compute expert offsets via cumulative sum ===
     #
-    # Strategy: sort pair indices by expert, then compute each pair's position
-    # within its expert group using a cumulative count. All done on GPU with
-    # no Python loops or .item() calls.
-    #
-    # Step 1: argsort gives us pair indices ordered by expert assignment.
-    # stable=True ensures pairs within the same expert keep their original order.
-    order = flat_ids.argsort(stable=True)
+    # expert_offsets[e] = starting index in sorted_token_ids for expert e.
+    # Example: padded [8, 0, 4, 8] → offsets [0, 8, 8, 12, 20]
+    # Expert 0 owns positions [0, 8), expert 1 owns [8, 8) (empty),
+    # expert 2 owns [8, 12), expert 3 owns [12, 20).
+    expert_offsets.zero_() #expert_offsets[0] = 0
+    expert_offsets[1:num_experts + 1] = tokens_per_expert_padded.cumsum(0)
 
-    # Step 2: Compute within-expert offsets.
-    # After sorting, pairs for expert 0 come first, then expert 1, etc.
-    # We need to know each pair's position within its expert's group:
-    #   pair 0 of expert 0 → offset 0, pair 1 of expert 0 → offset 1, ...
-    # We do this by subtracting the cumulative count at the start of each expert.
+    # === Step 4: Total padded count stays as GPU tensor (NO .item()!) ===
     #
-    # tokens_per_expert_cumsum[e] = total pairs for experts 0..e-1
-    # For each sorted pair, its expert's cumsum gives the starting count,
-    # and its position in the sorted array minus that cumsum gives the offset.
-    tokens_per_expert_cumsum = torch.zeros(
-        num_experts, dtype=torch.int32, device=topk_ids.device
+    # CRITICAL: This is the key change that makes CUDA graphs possible.
+    #
+    # Old code (graph-BREAKING):
+    #   num_tokens_post_padded = tokens_per_expert_padded.sum().item()
+    #   ^^^ .item() forces a CUDA synchronize — the CPU blocks until the
+    #   GPU finishes ALL pending work, then copies one int to CPU RAM.
+    #   During CUDA graph capture, this is ILLEGAL: the operations haven't
+    #   actually executed yet (they're being recorded), so there's no value
+    #   to copy. PyTorch raises "CUDA error: illegal memory access".
+    #
+    # New code (graph-SAFE):
+    #   num_tokens_post_padded[0] = expert_offsets[num_experts]
+    #   ^^^ GPU-to-GPU copy of a scalar. No CPU involvement. The kernel
+    #   reads this value via tl.load(num_tokens_post_padded_ptr) to
+    #   decide whether to early-exit for padding blocks.
+    num_tokens_post_padded[0] = expert_offsets[num_experts]
+
+    # === Step 5: Fill sorted_token_ids with sentinel value ===
+    #
+    # Old code (graph-BREAKING):
+    #   sorted_token_ids = torch.full((num_tokens_post_padded,), ...)
+    #   ^^^ Dynamic size from .item() result → variable allocation
+    #
+    # New code (graph-SAFE):
+    #   sorted_token_ids.fill_(num_pairs)
+    #   ^^^ Pre-allocated buffer, fixed size. fill_ is a standard CUDA
+    #   kernel on a fixed-size tensor. The sentinel value (num_pairs) is
+    #   a Python int computed from tensor .size() which is constant for
+    #   a given CUDA graph.
+    #
+    # The sentinel value (= num_pairs = T*K) is ≥ all valid pair indices
+    # (which are 0..num_pairs-1). The GEMM kernel checks:
+    #   if offs_token >= num_valid_tokens: skip (mask out)
+    # So padding slots produce zero output — correct behavior.
+    sorted_token_ids.fill_(num_pairs)
+
+    # === Step 6: Build expert_ids via searchsorted ===
+    #
+    # expert_ids[b] = which expert owns block b of BLOCK_SIZE_M tokens.
+    #
+    # Old code (graph-BREAKING):
+    #   expert_ids = torch.repeat_interleave(arange, blocks_per_expert)
+    #   ^^^ Output size = sum(blocks_per_expert) = num_tokens_post_padded
+    #   / block_size, which is DATA-DEPENDENT (varies with routing).
+    #   CUDA graphs require fixed tensor sizes.
+    #
+    # New code (graph-SAFE):
+    #   searchsorted on pre-allocated max_blocks-sized tensor.
+    #   Output size is always max_blocks (fixed).
+    #
+    # How searchsorted maps block positions to expert IDs:
+    #
+    #   expert_offsets   = [0, 64, 192, 256]  (cumulative padded counts)
+    #   block_positions  = [0, 64, 128, 192]  (= [0*64, 1*64, 2*64, 3*64])
+    #
+    #   searchsorted(offsets, 0,   right=True) = 1 → expert 0  ✓
+    #   searchsorted(offsets, 64,  right=True) = 2 → expert 1  ✓
+    #   searchsorted(offsets, 128, right=True) = 2 → expert 1  ✓
+    #   searchsorted(offsets, 192, right=True) = 3 → expert 2  ✓
+    #
+    #   right=True means: find index i where offsets[i-1] <= pos < offsets[i]
+    #   Then expert = i - 1.
+    #
+    # For blocks beyond the actual data (position >= num_tokens_post_padded),
+    # searchsorted returns num_experts+1, clamped to num_experts-1. These
+    # blocks are early-exited by the GEMM kernel before the expert ID is
+    # ever used, so the clamped value doesn't matter.
+    num_blocks = expert_ids.size(0)
+    expert_ids[:] = (
+        torch.searchsorted(
+            expert_offsets.contiguous(),
+            block_positions[:num_blocks].contiguous(),
+            right=True,
+        ) - 1
     )
-    tokens_per_expert_cumsum[1:] = tokens_per_expert[:-1].cumsum(0)
+    expert_ids.clamp_(0, num_experts - 1)
 
-    # For each pair in sorted order, look up its expert and that expert's
-    # cumulative count. Subtracting gives the within-expert index.
-    sorted_experts = flat_ids[order]  # expert IDs in sorted order
-    cumsum_for_each = tokens_per_expert_cumsum[sorted_experts.long()]
-    within_expert_idx = torch.arange(
-        num_valid_tokens, dtype=torch.int32, device=topk_ids.device
-    ) - cumsum_for_each
+    # === Step 7: Scatter pair indices into sorted positions ===
+    #
+    # Initialize write_counters to expert_offsets[:E]. Each counter tracks
+    # the next write position for that expert. The Triton scatter kernel
+    # atomically increments counters to reserve slots, then writes pair
+    # indices into sorted_token_ids at the reserved positions.
+    #
+    # After this step:
+    #   sorted_token_ids[offsets[e] : offsets[e]+count[e]] = pair indices
+    #   sorted_token_ids[offsets[e]+count[e] : offsets[e+1]] = sentinel
+    write_counters.copy_(expert_offsets[:num_experts])
+    SCATTER_BLOCK_SIZE = 256
+    scatter_grid = (triton.cdiv(num_pairs, SCATTER_BLOCK_SIZE),)
+    _moe_scatter_kernel[scatter_grid](
+        flat_ids, sorted_token_ids, write_counters, num_pairs,
+        BLOCK_SIZE=SCATTER_BLOCK_SIZE,
+    )
 
-    # Step 3: Compute the final write position for each pair.
-    # write_pos = expert_offsets[expert] + within_expert_idx
-    # expert_offsets already accounts for padding (each expert's block is
-    # padded to a multiple of block_size).
-    write_positions = expert_offsets[sorted_experts.long()] + within_expert_idx
-
-    # Step 4: Scatter pair indices into sorted_token_ids at the computed positions.
-    sorted_token_ids[write_positions.long()] = order.to(torch.int32)
-
-    # Apply expert_map for Expert Parallelism: remap global expert IDs to
-    # local IDs. Non-local experts become -1, telling the kernel to skip them.
+    # === Step 8: Apply expert_map for Expert Parallelism ===
+    #
+    # In EP mode, expert_map[global_id] = local_id (or -1 for non-local).
+    # Remap so the GEMM kernel indexes into local expert weights.
+    # Blocks with expert_id == -1 → kernel writes zeros and returns early.
     if expert_map is not None:
-        expert_ids = expert_map[expert_ids.long()]
-
-    num_tokens_post_padded_tensor = torch.tensor(
-        [num_tokens_post_padded], dtype=torch.int32, device=topk_ids.device
-    )
-
-    return sorted_token_ids, expert_ids, num_tokens_post_padded_tensor
+        expert_ids[:] = expert_map[expert_ids.long()]
 
 
 # ---------------------------------------------------------------------------
@@ -420,13 +805,33 @@ def invoke_fused_moe_kernel(
 
     vllm uses autotuning to find optimal configs per (E, N, device). We use
     fixed values for simplicity — the performance difference is typically <20%.
+
+    === CUDA Graph Compatibility ===
+
+    EM = sorted_token_ids.size(0). With pre-allocated buffers, this is always
+    max_padded (the worst-case size, computed once during warmup). This means
+    the grid size is FIXED regardless of the actual routing this step — exactly
+    what CUDA graphs require.
+
+    Blocks beyond the actual num_tokens_post_padded early-exit in the kernel:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+
+    So we launch more blocks than needed, but the excess ones exit immediately
+    after reading one int32 from GPU memory — negligible overhead.
     """
+    # EM = total sorted slots. With pre-allocated buffers, this is max_padded
+    # (constant), giving a fixed grid for CUDA graphs. Without pre-allocated
+    # buffers (eager fallback), it matches the actual padded count.
     EM = sorted_token_ids.size(0)
     N = B.size(1)
     K = B.size(2)
     num_valid_tokens = A.size(0) * top_k
 
-    # Grid: one thread block per (m_block, n_block) tile
+    # Grid: one thread block per (m_block, n_block) tile.
+    # With pre-allocated buffers: grid is constant (max_padded / 64 * N / 64).
+    # Excess blocks early-exit via GPU-resident num_tokens_post_padded.
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -464,6 +869,7 @@ def fused_moe(
     top_k: int,
     renormalize: bool = True,
     expert_map: torch.Tensor | None = None,
+    sorting_buffers: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """
     Full MoE forward pass: route tokens, compute expert MLPs, combine results.
@@ -490,13 +896,17 @@ def fused_moe(
         top_k: Number of experts to activate per token.
         renormalize: Whether to renormalize routing weights to sum to 1.
         expert_map: Global-to-local expert ID mapping for EP. None = no EP.
+        sorting_buffers: Pre-allocated sorting buffers from _allocate_sorting_buffers().
+            If None, buffers are allocated on-the-fly (eager mode, no CUDA graphs).
+            If provided, moe_align_block_size writes into these fixed-size buffers,
+            making the entire function CUDA-graph-safe.
 
     Returns:
         output: [num_tokens, hidden_size]
     """
     num_tokens = hidden_states.size(0)
     hidden_size = hidden_states.size(1)
-    num_experts = router_logits.size(1)  #w13.size(0)
+    num_experts = router_logits.size(1)
     intermediate_size = w2.size(2)  # w2 is [E, hidden, intermediate]
 
     # --- Step 1: Top-K routing ---
@@ -517,9 +927,31 @@ def fused_moe(
     # --- Step 2: Sort tokens by expert ---
     # This prepares the inputs for the Triton kernel. See moe_align_block_size
     # docstring for the full explanation.
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size=64, num_experts=num_experts, expert_map=expert_map,
+    #
+    # Two paths:
+    #   1. sorting_buffers provided → CUDA-graph-safe path. Writes into
+    #      pre-allocated fixed-size buffers. No dynamic allocation.
+    #   2. sorting_buffers is None → eager path. Allocates temporary buffers.
+    #      Used for standalone calls or when CUDA graphs are not needed.
+    if sorting_buffers is None:
+        # Eager fallback: allocate temporary buffers on-the-fly.
+        # This path is NOT CUDA-graph-safe (dynamic allocation), but is
+        # convenient for testing or prefill (which always runs eagerly).
+        sorting_buffers = _allocate_sorting_buffers(
+            num_tokens, top_k, num_experts, MOE_BLOCK_SIZE_M,
+            hidden_states.device,
+        )
+
+    moe_align_block_size(
+        topk_ids, block_size=MOE_BLOCK_SIZE_M, num_experts=num_experts,
+        expert_map=expert_map,
+        **sorting_buffers,
     )
+
+    # Read sorting results from the buffers.
+    sorted_token_ids = sorting_buffers['sorted_token_ids']
+    expert_ids = sorting_buffers['expert_ids']
+    num_tokens_post_padded = sorting_buffers['num_tokens_post_padded']
 
     # --- Step 3: Pass 1 — gate+up projection ---
     # w13 shape: [E, 2*intermediate_size, hidden_size]
@@ -638,6 +1070,12 @@ class FusedMoE(nn.Module):
         self.intermediate_size = intermediate_size
         self.renormalize = renormalize
 
+        # Sorting buffers are lazily allocated on first forward() call.
+        # They are NOT nn.Parameters or registered buffers — they're scratch
+        # space that doesn't need to be saved/loaded with the model.
+        # See _ensure_buffers() for details.
+        self._sorting_buffers: dict[str, torch.Tensor] | None = None
+
         # --- Expert Parallelism setup ---
         # We reuse the existing TP (Tensor Parallelism) process group for EP.
         # With tp_size GPUs, each GPU holds num_experts // tp_size experts.
@@ -740,6 +1178,66 @@ class FusedMoE(nn.Module):
         assert shard_id == "w2", f"Expected shard_id='w2', got '{shard_id}'"
         param.data[local_id].copy_(loaded_weight)
 
+    def _ensure_buffers(self, num_tokens: int, device: torch.device) -> None:
+        """
+        Lazily allocate fixed-size sorting buffers for CUDA-graph-safe MoE.
+
+        Called on the first forward() pass (typically during model warmup,
+        before CUDA graph capture). Once allocated, buffers persist for the
+        lifetime of the model and are reused across all subsequent calls.
+
+        === Why lazy allocation? ===
+
+        At __init__ time, model parameters are on CPU — we don't know the
+        CUDA device yet, and we don't know max_num_tokens until the engine
+        calls forward(). Lazy allocation naturally sizes buffers for the
+        actual maximum.
+
+        === Sizing guarantee ===
+
+        The engine calls warmup_model() first with max_num_batched_tokens
+        tokens (the largest batch the model will ever see). This triggers
+        _ensure_buffers() with the maximum, so all subsequent calls (CUDA
+        graph capture with smaller decode batches, and inference) reuse the
+        same oversized buffers. No reallocation ever happens during graph
+        replay.
+
+        === Buffer lifecycle ===
+
+        1. Model init (__init__):  _sorting_buffers = None
+        2. Warmup forward:         _ensure_buffers(max_tokens) → allocate
+        3. Graph capture forward:  _ensure_buffers(bs) → no-op (big enough)
+        4. Inference replay:       Sorting kernels write into same buffers
+
+        The buffers have FIXED addresses from step 2 onward, which is what
+        CUDA graphs require.
+
+        Args:
+            num_tokens: Number of tokens in the current forward pass.
+            device: CUDA device for tensor allocation.
+        """
+        if self._sorting_buffers is not None:
+            # Already allocated. Verify big enough (should always be True
+            # since warmup processes the largest batch, but defensive check).
+            existing_capacity = self._sorting_buffers['sorted_token_ids'].size(0)
+            needed_capacity = (
+                num_tokens * self.top_k
+                + self.num_experts * (MOE_BLOCK_SIZE_M - 1)
+            )
+            if existing_capacity >= needed_capacity:
+                return
+            # Rare: existing buffers too small. Reallocate.
+            # WARNING: This must NOT happen during CUDA graph replay
+            # (would change tensor addresses → graph corruption).
+
+        self._sorting_buffers = _allocate_sorting_buffers(
+            max_num_tokens=num_tokens,
+            top_k=self.top_k,
+            num_experts=self.num_experts,
+            block_size=MOE_BLOCK_SIZE_M,
+            device=device,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -755,8 +1253,17 @@ class FusedMoE(nn.Module):
         Returns:
             output: [num_tokens, hidden_size] — weighted sum of expert outputs.
         """
-        # Run the fused MoE computation. expert_map is passed so the kernel
-        # skips non-local experts (writes zeros for them).
+        # Ensure sorting buffers are allocated (no-op after first call).
+        # On the very first call (during warmup), this allocates buffers
+        # sized for the current (maximum) num_tokens. All subsequent calls
+        # reuse these same buffers — fixed addresses, fixed sizes.
+        self._ensure_buffers(hidden_states.size(0), hidden_states.device)
+
+        # Run the fused MoE computation with pre-allocated sorting buffers.
+        # This makes the entire forward pass CUDA-graph-safe:
+        # - moe_align_block_size writes into fixed-size buffers (no .item())
+        # - The Triton GEMM kernel grid is fixed (max_padded / BLOCK_SIZE_M)
+        # - Excess blocks early-exit via GPU-resident num_tokens_post_padded
         output = fused_moe(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -765,6 +1272,7 @@ class FusedMoE(nn.Module):
             top_k=self.top_k,
             renormalize=self.renormalize,
             expert_map=self.expert_map if self.tp_size > 1 else None,
+            sorting_buffers=self._sorting_buffers,
         )
 
         # All-reduce across GPUs to sum partial expert contributions.

@@ -36,16 +36,17 @@ class ModelRunner:
         is_moe = getattr(hf_config, "model_type", "qwen3") == "qwen3_moe"
         if is_moe:
             self.model = Qwen3MoeForCausalLM(hf_config)
-            # MoE models MUST run in eager mode — CUDA graphs are incompatible.
-            # Two reasons:
-            # 1. moe_align_block_size performs data-dependent token sorting that
-            #    changes every step (different tokens route to different experts).
-            #    CUDA graphs capture a fixed sequence of operations, so they can't
-            #    handle dynamic routing decisions.
-            # 2. The sorting function uses Python loops with .item() calls that
-            #    force CPU-GPU synchronization — illegal during graph capture,
-            #    causing "CUDA illegal memory access" errors.
-            self.enforce_eager = True
+            # MoE models now support CUDA graphs thanks to graph-safe sorting
+            # in FusedMoE. The three previously graph-breaking operations are
+            # replaced:
+            #   1. .item() → num_tokens_post_padded stays as GPU tensor
+            #   2. Dynamic-size allocation → pre-allocated fixed-size buffers
+            #   3. repeat_interleave → searchsorted (fixed output size)
+            # The Triton GEMM kernel grid uses max_padded (constant); excess
+            # blocks early-exit via GPU-resident num_tokens_post_padded.
+            # FusedMoE._ensure_buffers() allocates sorting buffers on the
+            # first forward (during warmup), which are reused across all
+            # subsequent graph captures and replays.
         else:
             self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
